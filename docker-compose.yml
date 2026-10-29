@@ -1,0 +1,96 @@
+# Systems integrator demo: Solo Enterprise for agentgateway, standalone (no Kubernetes).
+#
+#   ./demo.sh up        start everything
+#   ./demo.sh seed      backfill 30 days of synthetic usage into the gateway database (volume agw-data)
+#   ./demo.sh live      generate live traffic through the gateway (Ctrl+C to stop)
+#
+# Ports on the host (chosen so they do not collide with another local gateway):
+#   4300   agentgateway: LLM (/v1/messages) and MCP (/mcp)
+#   15300  agentgateway UI (http://localhost:15300/ui)
+#   15320  agentgateway Prometheus metrics
+#   15321  agentgateway readiness
+#   8380   Keycloak (admin / admin), realm si-demo
+#
+# The license key comes from .env (see .env.example). Never commit .env.
+
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.3
+    command: ["start-dev", "--import-realm", "--http-port=8380"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      # Every token carries iss=http://localhost:8380/realms/si-demo. The gateway shares
+      # this container's network namespace (see agentgateway below), so that URL works for the
+      # browser, the scripts and the gateway alike. MCP OAuth discovery depends on it.
+      KC_HOSTNAME: http://localhost:8380
+      KC_HEALTH_ENABLED: "true"
+    volumes:
+      - ./keycloak/realm-si-demo.json:/opt/keycloak/data/import/realm-si-demo.json:ro
+    ports:
+      # Keycloak, plus the gateway's ports: the gateway runs in this network namespace.
+      - "8380:8380"
+      - "4300:4300"
+      - "15300:15300"
+      - "15320:15320"
+      - "15321:15321"
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /health/ready HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q UP <&3"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+
+  mock-llm:
+    build: ./mock-llm
+    environment:
+      MOCK_LLM_QUIET: "1"
+
+  mcp-tickets:
+    build: ./mcp-servers
+    environment: { MCP_SERVER: tickets, PORT: "8000" }
+  mcp-docs:
+    build: ./mcp-servers
+    environment: { MCP_SERVER: docs, PORT: "8000" }
+  mcp-repo:
+    build: ./mcp-servers
+    environment: { MCP_SERVER: repo, PORT: "8000" }
+
+  agentgateway:
+    image: us-docker.pkg.dev/solo-public/enterprise-agentgateway/agentgateway-enterprise-bundle:${AGW_VERSION:-2026.10.1}
+    env_file: .env
+    environment:
+      AGW_BUNDLE_CONFIG_FILE: /config/config.yaml
+      AGW_BUNDLE_STS_ENABLED: "false"
+    volumes:
+      # Read-write: the UI saves edits back into config.yaml.
+      - ./gateway:/config
+      # A Docker volume, not a host folder. SQLite's write-ahead log needs shared memory
+      # that does not work across Colima's file share: opening the file from the Mac
+      # while the gateway writes it corrupts it. Only containers touch this volume.
+      - agw-data:/var/lib/agentgateway
+    # Share Keycloak's network namespace so http://localhost:8380 (the token issuer)
+    # resolves to Keycloak from inside the gateway too. Ports are published on keycloak.
+    network_mode: "service:keycloak"
+    depends_on:
+      keycloak: { condition: service_healthy }
+      mock-llm: { condition: service_started }
+      mcp-tickets: { condition: service_started }
+      mcp-docs: { condition: service_started }
+      mcp-repo: { condition: service_started }
+
+  # Runs scripts/backfill.py and counter resets against the gateway's database.
+  # Started only by ./demo.sh seed and reset-tom, always with the gateway stopped.
+  seeder:
+    image: python:3.12-slim
+    profiles: ["tools"]
+    user: "65532"
+    network_mode: "service:keycloak"   # reaches Keycloak at localhost:8380, for user IDs
+    environment:
+      KEYCLOAK_URL: http://localhost:8380
+    volumes:
+      - ./scripts:/scripts:ro
+      - agw-data:/data
+    working_dir: /scripts
+
+volumes:
+  agw-data:

@@ -1,0 +1,176 @@
+# yaml-language-server: $schema=https://agentgateway.dev/schema/config
+#
+# Systems integrator demo: Solo Enterprise for agentgateway, standalone.
+#
+# One gateway on port 4000 serves LLM traffic (/v1/messages) and the federated
+# MCP endpoint (/mcp). Keycloak realm si-demo issues every credential.
+#
+# The attribution mechanism, in one place (config.standardAttributes):
+#   bench-app            token has bench_user=<username>, no project  -> that person's USD 100 bench budget
+#   project-<x>-app      token has project=<x>, no bench_user         -> project budget only
+#   service apps         token has project=<x> and app=<name>         -> project budget, tagged by app
+# A budget whose subject attribute is missing on a request does not apply to it,
+# so a bench call never touches a project budget and a project call never touches
+# the person's bench budget.
+#
+# The proxy expands environment variables over this whole file, comments
+# included, so never write a bare dollar sign here except to name a variable.
+
+config:
+  # Same ports inside the container and on the host, so the UI's links and the MCP
+  # playground point at addresses that work from the browser.
+  adminAddr: 0.0.0.0:15300
+  statsAddr: 0.0.0.0:15320
+  readinessAddr: 0.0.0.0:15321
+  database:
+    url: sqlite:///var/lib/agentgateway/agentgateway.db
+
+  standardAttributes:
+    # Person for humans, app name for service accounts. The UI groups by this.
+    user: 'has(jwt.app) ? jwt.app : (has(jwt.preferred_username) ? jwt.preferred_username : "anonymous")'
+    # Which bucket paid: "bench" or "project-<name>". The UI groups by this too,
+    # so bench-versus-project is one click in Analytics.
+    group: 'has(jwt.project) ? "project-" + jwt.project : (has(jwt.bench_user) ? "bench" : "unattributed")'
+    # Budget dimensions. Unset when the claim is absent.
+    project: 'has(jwt.project) ? jwt.project : ""'
+    bench_user: 'has(jwt.bench_user) ? jwt.bench_user : ""'
+    app: 'has(jwt.app) ? jwt.app : (has(jwt.azp) ? jwt.azp : "")'
+
+  metrics:
+    fields:
+      add:
+        bucket: 'has(jwt.project) ? "project-" + jwt.project : (has(jwt.bench_user) ? "bench" : "unattributed")'
+        user: 'has(jwt.app) ? jwt.app : (has(jwt.preferred_username) ? jwt.preferred_username : "anonymous")'
+
+gateways:
+  default:
+    port: 4300
+
+llm:
+  providers:
+  # Bulk and generated traffic: an Anthropic-compatible mock that returns
+  # realistic usage blocks and costs nothing.
+  - name: mock-anthropic
+    provider: anthropic
+    params:
+      baseUrl: http://mock-llm:8080/v1
+      apiKey: mock-key
+  # Live moments: the real Anthropic API.
+  - name: anthropic
+    provider: anthropic
+    params:
+      apiKey: ${ANTHROPIC_API_KEY}
+
+  models:
+  # Requests that carry x-demo-backend: anthropic go to the real API. Everything
+  # else goes to the mock, so a mistake costs nothing.
+  - name: 'claude-*'
+    provider: { reference: anthropic }
+    matches:
+    - headers:
+      - name: x-demo-backend
+        value: { exact: anthropic }
+  - name: 'claude-*'
+    provider: { reference: mock-anthropic }
+
+  policies:
+    # Lets the UI's Chat Playground (admin port) call the gateway from the browser.
+    cors:
+      allowOrigins: ["http://localhost:15300"]
+      allowMethods: [GET, POST]
+      allowHeaders: ["*"]
+    jwtAuth:
+      mode: strict
+      issuer: ${KEYCLOAK_ISSUER}
+      audiences: [agentgateway]
+      jwks:
+        url: ${KEYCLOAK_JWKS_URL}
+    authorization:
+      rules:
+      # Wrong-app guard: a person may use a project app only if they are in that
+      # project's Keycloak group. Service accounts (app claim) are bound to their
+      # project by the client itself.
+      - require: '!has(jwt.project) || has(jwt.app) || ("project-" + jwt.project) in jwt.groups'
+
+  # All budgets are in US dollars. The gateway prices each response from its
+  # built-in model cost catalog (claude-haiku-4-5, claude-sonnet-4-5 and
+  # claude-opus-4-5 are in it) and charges the dollar cost after the call.
+  budgets:
+  # Bench: every person has an independent USD 100 counter for the 30-day window.
+  - name: bench-monthly
+    subject: { bench_user: "*" }
+    limit: { unit: USD, amount: 100 }
+    window: { rolling: 30d }
+    onBudgetExceeded: Block
+  # Projects: one shared counter per project.
+  - name: atlas-monthly
+    subject: { project: atlas }
+    limit: { unit: USD, amount: 2000 }
+    window: { rolling: 30d }
+    onBudgetExceeded: Block
+  - name: beacon-monthly
+    subject: { project: beacon }
+    limit: { unit: USD, amount: 1200 }
+    window: { rolling: 30d }
+    onBudgetExceeded: Block
+  - name: cobalt-monthly
+    subject: { project: cobalt }
+    limit: { unit: USD, amount: 800 }
+    window: { rolling: 30d }
+    onBudgetExceeded: Audit
+  # Demo overrides, so a block happens live in under a minute.
+  - name: tom-vega-daily
+    subject: { bench_user: tom.vega }
+    limit: { unit: USD, amount: 3 }
+    window: { rolling: 24h }
+    onBudgetExceeded: Block
+  - name: cobalt-daily
+    subject: { project: cobalt }
+    limit: { unit: USD, amount: 40 }
+    window: { rolling: 24h }
+    onBudgetExceeded: Audit
+
+mcp:
+  targets:
+  - name: tickets
+    mcp: { host: http://mcp-tickets:8000/mcp }
+  - name: docs
+    mcp: { host: http://mcp-docs:8000/mcp }
+  - name: repo
+    mcp: { host: http://mcp-repo:8000/mcp }
+
+  policies:
+    cors:
+      # The UI's MCP playground runs on the admin port.
+      allowOrigins: ["http://localhost:15300"]
+      allowMethods: [GET, POST]
+      allowHeaders: ["*"]
+      exposeHeaders: ["Mcp-Session-Id"]
+    mcpAuthentication:
+      mode: strict
+      issuer: ${KEYCLOAK_ISSUER}
+      audiences: [agentgateway]
+      provider:
+        keycloak: {}
+      jwks:
+        url: ${KEYCLOAK_JWKS_URL}
+      resourceMetadata:
+        resource: ${MCP_PUBLIC_URL}
+        scopesSupported: [openid, profile, offline_access]
+        bearerMethodsSupported: [header]
+    mcpAuthorization:
+      rules:
+      # Everyone signed in may list and call tools. Only project members may read
+      # a project's repository code.
+      - allow: 'mcp.tool.target != "repo"'
+      - allow: 'jwt.groups.exists(g, g.startsWith("project-"))'
+    # Per-tool limit: search_tickets is limited to 5 calls a minute per person.
+    # The other tools are not limited.
+    localRateLimit:
+      conditional:
+      - condition: 'mcp.tool.name == "search_tickets"'
+        key: 'default(jwt.preferred_username, "anonymous")'
+        type: requests
+        maxTokens: 5
+        tokensPerFill: 5
+        fillInterval: 60s
